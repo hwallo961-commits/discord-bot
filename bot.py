@@ -6,7 +6,7 @@ from discord import app_commands
 TOKEN = os.environ["DISCORD_TOKEN"]
 
 # 중개 관리자 역할 ID
-ADMIN_ROLE_ID = 1567325646210998313
+ADMIN_ROLE_ID = 1567743560055263292
 
 intents = discord.Intents.default()
 bot = discord.Client(intents=intents)
