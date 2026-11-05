@@ -16,7 +16,6 @@ TICKET_CHANNEL_ID = 1567747285365039114
 
 PANEL_MARKER = "중개 티켓 안내 패널"
 
-# 담당자 중복 배정 방지
 claim_lock = asyncio.Lock()
 
 
@@ -29,7 +28,6 @@ intents.members = True
 
 
 class MediationBot(commands.Bot):
-
     async def setup_hook(self):
         self.add_view(TicketPanelView())
         self.add_view(TicketControlsView())
@@ -39,6 +37,26 @@ bot = MediationBot(
     command_prefix="!",
     intents=intents
 )
+
+
+# =========================
+# 개인 메시지 발송
+# =========================
+
+async def send_dm(member, embed):
+    try:
+        await member.send(embed=embed)
+        print(f"DM 발송 성공: {member}")
+
+        return True
+
+    except discord.Forbidden:
+        print(f"DM 발송 거부: {member}")
+        return False
+
+    except discord.HTTPException as error:
+        print(f"DM 발송 오류: {member} / {error}")
+        return False
 
 
 # =========================
@@ -52,7 +70,9 @@ async def find_member(guild, value):
 
     if mention:
         try:
-            return await guild.fetch_member(int(mention.group(1)))
+            return await guild.fetch_member(
+                int(mention.group(1))
+            )
         except discord.NotFound:
             return None
 
@@ -70,6 +90,7 @@ async def find_member(guild, value):
 
         if member.name.casefold() == username:
             exact.append(member)
+
         elif (
             member.display_name.casefold() == username
             or (
@@ -81,7 +102,10 @@ async def find_member(guild, value):
 
     matches = exact if exact else display
 
-    unique = {member.id: member for member in matches}
+    unique = {
+        member.id: member
+        for member in matches
+    }
 
     if len(unique) == 1:
         return list(unique.values())[0]
@@ -103,11 +127,7 @@ class TicketControlsView(discord.ui.View):
         style=discord.ButtonStyle.success,
         custom_id="middleman_claim"
     )
-    async def claim(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
+    async def claim(self, interaction, button):
 
         role = interaction.guild.get_role(ADMIN_ROLE_ID)
 
@@ -142,22 +162,21 @@ class TicketControlsView(discord.ui.View):
                 )
 
                 # 담당자 정보 저장
-                new_topic = (
-                    topic + f";mediator={interaction.user.id}"
-                )
+                new_topic = topic + f";mediator={interaction.user.id}"
 
                 await channel.edit(topic=new_topic)
 
-                # 담당 버튼 비활성화
+                # 버튼 비활성화
                 button.disabled = True
-                button.label = f"{interaction.user.display_name} 담당 중"
+                button.label = (
+                    f"{interaction.user.display_name} 담당 중"
+                )
 
                 embed = discord.Embed(
                     title="중개 담당자 배정 완료",
                     description=(
                         f"{interaction.user.mention} 님이 "
-                        "이번 중개를 담당합니다.\n\n"
-                        "이제 담당 중개자만 대화할 수 있습니다."
+                        "이번 거래를 담당합니다."
                     ),
                     color=discord.Color.green()
                 )
@@ -166,6 +185,35 @@ class TicketControlsView(discord.ui.View):
                     embed=embed,
                     view=self
                 )
+
+                # 거래 당사자 ID 확인
+                data = dict(
+                    item.split("=", 1)
+                    for item in topic.split(";")
+                )
+
+                buyer = await interaction.guild.fetch_member(
+                    int(data["buyer"])
+                )
+
+                seller = await interaction.guild.fetch_member(
+                    int(data["seller"])
+                )
+
+                # 담당자 배정 DM
+                dm_embed = discord.Embed(
+                    title="중개 담당자 배정 안내",
+                    description=(
+                        "중개 담당자가 배정되었습니다.\n\n"
+                        f"담당 중개자: {interaction.user.mention}\n"
+                        f"중개 채널: {channel.mention}\n\n"
+                        "중개 채널에서 거래를 진행해 주세요."
+                    ),
+                    color=discord.Color.green()
+                )
+
+                for member in {buyer.id: buyer, seller.id: seller}.values():
+                    await send_dm(member, dm_embed)
 
                 await interaction.followup.send(
                     "중개 담당자로 배정되었습니다.",
@@ -179,16 +227,18 @@ class TicketControlsView(discord.ui.View):
                     ephemeral=True
                 )
 
+            except (ValueError, KeyError, discord.NotFound):
+                await interaction.followup.send(
+                    "중개 정보를 확인할 수 없습니다.",
+                    ephemeral=True
+                )
+
     @discord.ui.button(
         label="중개 종료 및 채널 삭제",
         style=discord.ButtonStyle.danger,
         custom_id="middleman_close"
     )
-    async def close(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
+    async def close(self, interaction, button):
 
         role = interaction.guild.get_role(ADMIN_ROLE_ID)
 
@@ -268,11 +318,13 @@ class TicketModal(discord.ui.Modal):
             return
 
         buyer = await find_member(
-            guild, self.buyer_name.value
+            guild,
+            self.buyer_name.value
         )
 
         seller = await find_member(
-            guild, self.seller_name.value
+            guild,
+            self.seller_name.value
         )
 
         if buyer is None or seller is None:
@@ -299,7 +351,7 @@ class TicketModal(discord.ui.Modal):
             )
             return
 
-        # 기본적으로 중개 관리자 역할은 읽기만 가능
+        # 채널 권한 설정
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(
                 view_channel=False
@@ -363,6 +415,7 @@ class TicketModal(discord.ui.Modal):
             )
             return
 
+        # 티켓 안내 메시지
         embed = discord.Embed(
             title="중개 신청 접수",
             description=(
@@ -398,6 +451,21 @@ class TicketModal(discord.ui.Modal):
             embed=embed,
             view=TicketControlsView()
         )
+
+        # 티켓 생성 DM
+        dm_embed = discord.Embed(
+            title="중개 신청 접수 안내",
+            description=(
+                "중개 신청이 정상적으로 접수되었습니다.\n\n"
+                f"거래 가격: {self.price.value}\n"
+                f"중개 채널: {ticket_channel.mention}\n\n"
+                "중개자가 배정되면 다시 안내해 드리겠습니다."
+            ),
+            color=discord.Color.blue()
+        )
+
+        for member in {buyer.id: buyer, seller.id: seller}.values():
+            await send_dm(member, dm_embed)
 
         await interaction.followup.send(
             f"중개 채널이 생성되었습니다: {ticket_channel.mention}",
