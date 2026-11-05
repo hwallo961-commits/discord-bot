@@ -75,16 +75,13 @@ class TicketCloseView(discord.ui.View):
 
         role = interaction.guild.get_role(ADMIN_ROLE_ID)
         is_admin = role is not None and role in interaction.user.roles
-        is_participant = interaction.user.id in [
-            requester_id, buyer_id, seller_id
-        ]
 
-        if not (is_admin or is_participant):
-            await interaction.response.send_message(
-                "중개 참여자 또는 관리자만 종료할 수 있습니다.",
-                ephemeral=True
-            )
-            return
+if not is_admin:
+    await interaction.response.send_message(
+        "중개 관리자만 채널을 종료할 수 있습니다.",
+        ephemeral=True
+    )
+    return
 
         await interaction.response.send_message(
             "중개 종료! 채널을 삭제합니다.",
