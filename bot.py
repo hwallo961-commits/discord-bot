@@ -83,12 +83,12 @@ if not is_admin:
     )
     return
 
-        await interaction.response.send_message(
+await interaction.response.send_message(
             "중개 종료! 채널을 삭제합니다.",
             ephemeral=True
         )
 
-        await channel.delete(reason="중개 종료")
+await channel.delete(reason="중개 종료")
 
 
 class TicketModal(discord.ui.Modal, title="중개 신청"):
