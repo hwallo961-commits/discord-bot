@@ -1,6 +1,7 @@
 
 import os
 import re
+import asyncio
 import discord
 from discord.ext import commands
 
@@ -15,14 +16,26 @@ TICKET_CHANNEL_ID = 1567747285365039114
 
 PANEL_MARKER = "중개 티켓 안내 패널"
 
+# 담당자 중복 배정 방지
+claim_lock = asyncio.Lock()
+
+
 # =========================
-# 봇 권한 설정
+# 봇 설정
 # =========================
 
 intents = discord.Intents.default()
 intents.members = True
 
-bot = commands.Bot(
+
+class MediationBot(commands.Bot):
+
+    async def setup_hook(self):
+        self.add_view(TicketPanelView())
+        self.add_view(TicketControlsView())
+
+
+bot = MediationBot(
     command_prefix="!",
     intents=intents
 )
@@ -35,65 +48,136 @@ bot = commands.Bot(
 async def find_member(guild, value):
     value = value.strip()
 
-    # 실제 멘션 형식도 지원
-    mention_match = re.fullmatch(r"<@!?(\d+)>", value)
+    mention = re.fullmatch(r"<@!?(\d+)>", value)
 
-    if mention_match:
-        member_id = int(mention_match.group(1))
-
+    if mention:
         try:
-            return await guild.fetch_member(member_id)
+            return await guild.fetch_member(int(mention.group(1)))
         except discord.NotFound:
             return None
 
-    # @ 기호 제거
     username = value.removeprefix("@").strip().casefold()
 
     if not username:
         return None
 
-    exact_username = []
-    display_matches = []
+    exact = []
+    display = []
 
     async for member in guild.fetch_members(limit=None):
         if member.bot:
             continue
 
         if member.name.casefold() == username:
-            exact_username.append(member)
-
+            exact.append(member)
         elif (
             member.display_name.casefold() == username
             or (
-                member.global_name is not None
+                member.global_name
                 and member.global_name.casefold() == username
             )
         ):
-            display_matches.append(member)
+            display.append(member)
 
-    # 실제 Discord 사용자명 우선
-    matches = exact_username if exact_username else display_matches
+    matches = exact if exact else display
 
-    # 중복 제거
-    unique_matches = {
-        member.id: member
-        for member in matches
-    }
+    unique = {member.id: member for member in matches}
 
-    if len(unique_matches) == 1:
-        return list(unique_matches.values())[0]
+    if len(unique) == 1:
+        return list(unique.values())[0]
 
     return None
 
 
 # =========================
-# 중개 종료 버튼
+# 중개 담당 및 종료 버튼
 # =========================
 
-class TicketCloseView(discord.ui.View):
+class TicketControlsView(discord.ui.View):
 
     def __init__(self):
         super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="중개 담당하기",
+        style=discord.ButtonStyle.success,
+        custom_id="middleman_claim"
+    )
+    async def claim(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+
+        role = interaction.guild.get_role(ADMIN_ROLE_ID)
+
+        if role is None or role not in interaction.user.roles:
+            await interaction.response.send_message(
+                "중개 관리자만 담당할 수 있습니다.",
+                ephemeral=True
+            )
+            return
+
+        async with claim_lock:
+
+            channel = interaction.channel
+            topic = channel.topic or ""
+
+            if "mediator=" in topic:
+                await interaction.response.send_message(
+                    "이미 다른 중개자가 담당하고 있습니다.",
+                    ephemeral=True
+                )
+                return
+
+            await interaction.response.defer(ephemeral=True)
+
+            try:
+                # 담당자에게 대화 권한 부여
+                await channel.set_permissions(
+                    interaction.user,
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True
+                )
+
+                # 담당자 정보 저장
+                new_topic = (
+                    topic + f";mediator={interaction.user.id}"
+                )
+
+                await channel.edit(topic=new_topic)
+
+                # 담당 버튼 비활성화
+                button.disabled = True
+                button.label = f"{interaction.user.display_name} 담당 중"
+
+                embed = discord.Embed(
+                    title="중개 담당자 배정 완료",
+                    description=(
+                        f"{interaction.user.mention} 님이 "
+                        "이번 중개를 담당합니다.\n\n"
+                        "이제 담당 중개자만 대화할 수 있습니다."
+                    ),
+                    color=discord.Color.green()
+                )
+
+                await interaction.message.edit(
+                    embed=embed,
+                    view=self
+                )
+
+                await interaction.followup.send(
+                    "중개 담당자로 배정되었습니다.",
+                    ephemeral=True
+                )
+
+            except discord.Forbidden:
+                await interaction.followup.send(
+                    "채널 권한을 변경할 수 없습니다. "
+                    "봇의 채널 관리 권한을 확인해 주세요.",
+                    ephemeral=True
+                )
 
     @discord.ui.button(
         label="중개 종료 및 채널 삭제",
@@ -113,7 +197,6 @@ class TicketCloseView(discord.ui.View):
             and role in interaction.user.roles
         )
 
-        # 관리자만 종료 가능
         if not is_admin:
             await interaction.response.send_message(
                 "중개 관리자만 채널을 종료할 수 있습니다.",
@@ -127,12 +210,12 @@ class TicketCloseView(discord.ui.View):
         )
 
         await interaction.channel.delete(
-            reason=f"중개 종료 - 관리자: {interaction.user}"
+            reason=f"중개 종료 - {interaction.user}"
         )
 
 
 # =========================
-# 중개 신청 모달
+# 중개 신청 입력창
 # =========================
 
 class TicketModal(discord.ui.Modal):
@@ -143,44 +226,34 @@ class TicketModal(discord.ui.Modal):
         self.price = discord.ui.TextInput(
             label="거래 가격",
             placeholder="예: 50000원",
-            max_length=50,
-            required=True
+            max_length=50
         )
 
         self.buyer_name = discord.ui.TextInput(
             label="구매자 사용자명",
             placeholder="예: @buyer123",
-            max_length=100,
-            required=True
+            max_length=100
         )
 
         self.seller_name = discord.ui.TextInput(
             label="판매자 사용자명",
             placeholder="예: @seller456",
-            max_length=100,
-            required=True
+            max_length=100
         )
 
         self.add_item(self.price)
         self.add_item(self.buyer_name)
         self.add_item(self.seller_name)
 
-    async def on_submit(
-        self,
-        interaction: discord.Interaction
-    ):
+    async def on_submit(self, interaction):
 
-        # 처리 시간이 길어져도 응답 시간 초과 방지
-        await interaction.response.defer(
-            ephemeral=True,
-            thinking=True
-        )
+        await interaction.response.defer(ephemeral=True)
 
         guild = interaction.guild
 
         if guild is None:
             await interaction.followup.send(
-                "서버에서만 신청할 수 있습니다.",
+                "서버에서 신청해 주세요.",
                 ephemeral=True
             )
             return
@@ -194,61 +267,42 @@ class TicketModal(discord.ui.Modal):
             )
             return
 
-        # 구매자 검색
         buyer = await find_member(
-            guild,
-            self.buyer_name.value
+            guild, self.buyer_name.value
         )
 
-        # 판매자 검색
         seller = await find_member(
-            guild,
-            self.seller_name.value
+            guild, self.seller_name.value
         )
 
-        if buyer is None:
+        if buyer is None or seller is None:
             await interaction.followup.send(
-                "구매자를 찾을 수 없거나 사용자명이 중복됩니다. "
-                "서버의 정확한 사용자명을 입력해 주세요.",
-                ephemeral=True
-            )
-            return
-
-        if seller is None:
-            await interaction.followup.send(
-                "판매자를 찾을 수 없거나 사용자명이 중복됩니다. "
-                "서버의 정확한 사용자명을 입력해 주세요.",
+                "구매자 또는 판매자를 찾을 수 없습니다. "
+                "정확한 사용자명을 확인해 주세요.",
                 ephemeral=True
             )
             return
 
         if buyer.id == seller.id:
             await interaction.followup.send(
-                "구매자와 판매자는 서로 다른 사람이어야 합니다.",
+                "구매자와 판매자는 서로 달라야 합니다.",
                 ephemeral=True
             )
             return
 
         requester = interaction.user
 
-        # 신청자는 구매자 또는 판매자여야 함
         if requester.id not in [buyer.id, seller.id]:
             await interaction.followup.send(
-                "신청자는 구매자 또는 판매자 중 한 명이어야 합니다.",
+                "신청자는 구매자 또는 판매자여야 합니다.",
                 ephemeral=True
             )
             return
 
-        # 거래 채널 권한 설정
+        # 기본적으로 중개 관리자 역할은 읽기만 가능
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(
                 view_channel=False
-            ),
-
-            requester: discord.PermissionOverwrite(
-                view_channel=True,
-                send_messages=True,
-                read_message_history=True
             ),
 
             buyer: discord.PermissionOverwrite(
@@ -265,14 +319,12 @@ class TicketModal(discord.ui.Modal):
 
             admin_role: discord.PermissionOverwrite(
                 view_channel=True,
-                send_messages=True,
-                read_message_history=True,
-                manage_channels=True
+                send_messages=False,
+                read_message_history=True
             )
         }
 
-        # 봇 본인 권한
-        if guild.me is not None:
+        if guild.me:
             overwrites[guild.me] = discord.PermissionOverwrite(
                 view_channel=True,
                 send_messages=True,
@@ -280,7 +332,6 @@ class TicketModal(discord.ui.Modal):
                 manage_channels=True
             )
 
-        # 채널 이름 생성
         channel_name = (
             f"중개-{buyer.display_name[:12]}-{seller.display_name[:12]}"
         )
@@ -291,7 +342,6 @@ class TicketModal(discord.ui.Modal):
             channel_name
         )
 
-        # 거래 정보 저장
         topic = (
             f"requester={requester.id};"
             f"buyer={buyer.id};"
@@ -313,10 +363,12 @@ class TicketModal(discord.ui.Modal):
             )
             return
 
-        # 거래 정보 표시
         embed = discord.Embed(
-            title="중개 신청 완료",
-            description="중개 거래가 접수되었습니다.",
+            title="중개 신청 접수",
+            description=(
+                "아직 담당 중개자가 배정되지 않았습니다.\n"
+                "중개 관리자 중 한 명이 담당 버튼을 눌러야 합니다."
+            ),
             color=discord.Color.blue()
         )
 
@@ -328,30 +380,23 @@ class TicketModal(discord.ui.Modal):
 
         embed.add_field(
             name="구매자",
-            value=f"{buyer.mention}\nID: `{buyer.id}`",
+            value=buyer.mention,
             inline=True
         )
 
         embed.add_field(
             name="판매자",
-            value=f"{seller.mention}\nID: `{seller.id}`",
+            value=seller.mention,
             inline=True
         )
 
-        embed.add_field(
-            name="신청자",
-            value=requester.mention,
-            inline=False
-        )
-
-        embed.set_footer(
-            text="중개 관리자만 중개 종료 버튼을 사용할 수 있습니다."
-        )
-
         await ticket_channel.send(
-            content=f"{buyer.mention} {seller.mention} {admin_role.mention}",
+            content=(
+                f"{buyer.mention} {seller.mention} "
+                f"{admin_role.mention}"
+            ),
             embed=embed,
-            view=TicketCloseView()
+            view=TicketControlsView()
         )
 
         await interaction.followup.send(
@@ -361,7 +406,7 @@ class TicketModal(discord.ui.Modal):
 
 
 # =========================
-# 중개 티켓 생성 버튼
+# 티켓 생성 버튼
 # =========================
 
 class TicketPanelView(discord.ui.View):
@@ -374,11 +419,7 @@ class TicketPanelView(discord.ui.View):
         style=discord.ButtonStyle.success,
         custom_id="open_middleman_ticket"
     )
-    async def open_ticket(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
+    async def open_ticket(self, interaction, button):
 
         await interaction.response.send_modal(
             TicketModal()
@@ -386,26 +427,7 @@ class TicketPanelView(discord.ui.View):
 
 
 # =========================
-# 봇 시작 시 설정
-# =========================
-
-class MediationBot(commands.Bot):
-
-    async def setup_hook(self):
-
-        # 버튼을 재시작 후에도 유지
-        self.add_view(TicketPanelView())
-        self.add_view(TicketCloseView())
-
-
-bot = MediationBot(
-    command_prefix="!",
-    intents=intents
-)
-
-
-# =========================
-# 중개 티켓 안내 패널
+# 봇 시작
 # =========================
 
 panel_created = False
@@ -421,15 +443,14 @@ async def on_ready():
     if panel_created:
         return
 
-    panel_channel = bot.get_channel(TICKET_CHANNEL_ID)
+    channel = bot.get_channel(TICKET_CHANNEL_ID)
 
-    if panel_channel is None:
+    if channel is None:
         print("중개 티켓 채널을 찾을 수 없습니다.")
         return
 
     try:
-        # 기존 패널 확인
-        async for message in panel_channel.history(limit=50):
+        async for message in channel.history(limit=50):
 
             if (
                 message.author.id == bot.user.id
@@ -439,7 +460,6 @@ async def on_ready():
                 print("기존 중개 티켓 패널 확인 완료")
                 return
 
-        # 새 패널 생성
         embed = discord.Embed(
             title="중개 티켓",
             description=(
@@ -450,25 +470,17 @@ async def on_ready():
             color=discord.Color.blue()
         )
 
-        await panel_channel.send(
+        await channel.send(
             content=PANEL_MARKER,
             embed=embed,
             view=TicketPanelView()
         )
 
         panel_created = True
-
         print("중개 티켓 패널 생성 완료")
-
-    except discord.Forbidden:
-        print("중개 티켓 채널 권한을 확인해 주세요.")
 
     except Exception as error:
         print(f"패널 생성 오류: {error}")
 
-
-# =========================
-# 봇 실행
-# =========================
 
 bot.run(TOKEN)
